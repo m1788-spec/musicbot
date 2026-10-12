@@ -1,6 +1,6 @@
 import os
-import logging
 import sqlite3
+import logging
 from datetime import datetime, timezone
 
 from telegram import (
@@ -8,747 +8,949 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
 
-# ==========================================
-# تنظیمات
-# ==========================================
+# =========================
+# CONFIG
+# =========================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8982085745"))
-
-DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
+DB_PATH = os.getenv("DB_PATH", "/app/bot.db")
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
 )
+log = logging.getLogger(__name__)
 
-logger = logging.getLogger(__name__)
+
+# =========================
+# DATABASE
+# =========================
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=30)
+    con.row_factory = sqlite3.Row
+    return con
 
 
-# ==========================================
-# دیتابیس
-# ==========================================
-
-def get_db():
-    folder = os.path.dirname(DB_PATH)
-
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    return conn
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 
 def init_db():
-    with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT,
-                joined_at TEXT
-            )
+    with db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS rb_tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL UNIQUE,
+            title TEXT DEFAULT '',
+            url TEXT DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_admins (
+            user_id INTEGER PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            invite_link TEXT DEFAULT '',
+            target INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_campaign_joins (
+            campaign_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            joined_at TEXT NOT NULL,
+            PRIMARY KEY (campaign_id, user_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS rb_states (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT NOT NULL
+        );
         """)
 
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tracks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_id TEXT NOT NULL,
-                file_type TEXT NOT NULL,
-                title TEXT,
-                uploader_id INTEGER,
-                created_at TEXT
-            )
-        """)
-
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS channels (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                url TEXT NOT NULL,
-                title TEXT
-            )
-        """)
-
-        conn.commit()
-
-
-def save_user(user):
-    if not user:
-        return
-
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO users (
-                user_id, username, first_name, joined_at
-            )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username = excluded.username,
-                first_name = excluded.first_name
-        """, (
-            user.id,
-            user.username or "",
-            user.first_name or "",
-            datetime.now(timezone.utc).isoformat(),
-        ))
-
-
-def save_track(file_id, file_type, title, uploader_id):
-    with get_db() as conn:
-        cursor = conn.execute("""
-            INSERT INTO tracks (
-                file_id, file_type, title, uploader_id, created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            file_id,
-            file_type,
-            title or "آهنگ بدون نام",
-            uploader_id,
-            datetime.now(timezone.utc).isoformat(),
-        ))
-
-        conn.commit()
-        return cursor.lastrowid
-
-
-def get_track(track_id):
-    with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM tracks WHERE id = ?",
-            (track_id,),
-        ).fetchone()
-
-
-def get_channels():
-    with get_db() as conn:
-        return conn.execute(
-            "SELECT * FROM channels ORDER BY id"
-        ).fetchall()
-
-
-def add_channel(username, url, title=""):
-    username = username.strip()
-
-    with get_db() as conn:
-        conn.execute("""
-            INSERT INTO channels (username, url, title)
-            VALUES (?, ?, ?)
-            ON CONFLICT(username) DO UPDATE SET
-                url = excluded.url,
-                title = excluded.title
-        """, (username, url, title or username))
-
-        conn.commit()
-
-
-def delete_channel(channel_id):
-    with get_db() as conn:
-        cursor = conn.execute(
-            "DELETE FROM channels WHERE id = ?",
-            (channel_id,),
+        con.execute(
+            """INSERT OR IGNORE INTO rb_settings(key, value)
+               VALUES('join_text', ?)""",
+            ("🎧 برای دانلود ریمیکس، ابتدا عضو کانال‌های زیر شو ❤️",),
         )
-        conn.commit()
-        return cursor.rowcount > 0
 
 
-def get_stats():
-    with get_db() as conn:
-        users = conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
-
-        tracks = conn.execute(
-            "SELECT COUNT(*) FROM tracks"
-        ).fetchone()[0]
-
-        channels = conn.execute(
-            "SELECT COUNT(*) FROM channels"
-        ).fetchone()[0]
-
-    return users, tracks, channels
+def get_setting(key, default=""):
+    with db() as con:
+        row = con.execute(
+            "SELECT value FROM rb_settings WHERE key=?",
+            (key,),
+        ).fetchone()
+    return row["value"] if row else default
 
 
-def get_all_user_ids():
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT user_id FROM users"
-        ).fetchall()
+def set_setting(key, value):
+    with db() as con:
+        con.execute(
+            """INSERT INTO rb_settings(key, value) VALUES(?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, str(value)),
+        )
 
-    return [row["user_id"] for row in rows]
+
+def set_state(user_id, state):
+    with db() as con:
+        con.execute(
+            """INSERT INTO rb_states(user_id, state) VALUES(?, ?)
+               ON CONFLICT(user_id) DO UPDATE SET state=excluded.state""",
+            (user_id, state),
+        )
 
 
-# ==========================================
-# ابزارهای کمکی
-# ==========================================
+def get_state(user_id):
+    with db() as con:
+        row = con.execute(
+            "SELECT state FROM rb_states WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    return row["state"] if row else None
+
+
+def clear_state(user_id):
+    with db() as con:
+        con.execute(
+            "DELETE FROM rb_states WHERE user_id=?",
+            (user_id,),
+        )
+
 
 def is_admin(user_id):
-    return user_id == ADMIN_ID
+    if user_id == ADMIN_ID:
+        return True
+
+    with db() as con:
+        row = con.execute(
+            "SELECT 1 FROM rb_admins WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+
+    return row is not None
 
 
-async def check_membership(bot, user_id):
-    channels = get_channels()
+# =========================
+# MENUS
+# =========================
+
+def home_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎵 راهنمای دانلود", callback_data="help")]
+    ])
+
+
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("➕ افزودن آهنگ", callback_data="addtrack"),
+            InlineKeyboardButton("🗑 حذف آهنگ", callback_data="deltrack"),
+        ],
+        [
+            InlineKeyboardButton("📢 کانال‌ها", callback_data="channels"),
+            InlineKeyboardButton("🎯 کمپین‌ها", callback_data="campaigns"),
+        ],
+        [
+            InlineKeyboardButton("✏️ متن عضویت", callback_data="jointext"),
+            InlineKeyboardButton("📊 آمار", callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("👥 راهنمای مدیران", callback_data="admins"),
+        ],
+    ])
+
+
+# =========================
+# MEMBERSHIP
+# =========================
+
+async def check_membership(context, user_id):
+    with db() as con:
+        channels = con.execute(
+            "SELECT * FROM rb_channels"
+        ).fetchall()
+
+    missing = []
 
     for channel in channels:
         try:
-            member = await bot.get_chat_member(
-                chat_id=channel["username"],
-                user_id=user_id,
+            member = await context.bot.get_chat_member(
+                channel["chat_id"], user_id
             )
 
-            if member.status in (
-                ChatMemberStatus.LEFT,
-                ChatMemberStatus.BANNED,
-            ):
-                return False
+            if member.status in ("left", "kicked"):
+                missing.append(channel)
 
-            if (
-                member.status == ChatMemberStatus.RESTRICTED
-                and not getattr(member, "is_member", False)
-            ):
-                return False
-
-        except Exception:
-            logger.exception(
+        except TelegramError:
+            log.exception(
                 "Membership check failed for %s",
-                channel["username"],
+                channel["chat_id"],
             )
-            return False
+            missing.append(channel)
 
-    return True
+    return missing
 
 
-def membership_keyboard(track_id=0):
-    buttons = []
+def membership_keyboard(channels):
+    rows = []
 
-    for channel in get_channels():
-        buttons.append([
+    for channel in channels:
+        url = channel["url"]
+
+        if not url:
+            username = channel["chat_id"].lstrip("@")
+            url = f"https://t.me/{username}"
+
+        rows.append([
             InlineKeyboardButton(
-                f"عضویت در {channel['title'] or channel['username']}",
-                url=channel["url"],
+                f"📢 {channel['title'] or 'عضویت در کانال'}",
+                url=url,
             )
         ])
 
-    buttons.append([
+    rows.append([
         InlineKeyboardButton(
-            "بررسی عضویت ✅",
-            callback_data=f"check:{track_id}",
+            "✅ بررسی عضویت",
+            callback_data="checkjoin",
         )
     ])
 
-    return InlineKeyboardMarkup(buttons)
+    return InlineKeyboardMarkup(rows)
 
 
-async def send_track(chat_id, track, context):
-    caption = f"🎵 {track['title'] or 'آهنگ'}"
+# =========================
+# TRACKS
+# =========================
 
-    if track["file_type"] == "document":
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=track["file_id"],
-            caption=caption,
+def save_track(file_id, file_type, title):
+    with db() as con:
+        cur = con.execute(
+            """INSERT INTO rb_tracks
+               (file_id, file_type, title, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (file_id, file_type, title, now()),
         )
-    else:
-        await context.bot.send_audio(
-            chat_id=chat_id,
-            audio=track["file_id"],
-            caption=caption,
-        )
+        return cur.lastrowid
 
 
-async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def send_track(update, context, track_id):
+    message = update.effective_message
     user = update.effective_user
 
-    text = (
-        "سلام! 🎵\n\n"
-        "به ربات دریافت آهنگ خوش اومدی.\n"
-        "برای دریافت آهنگ، لینک اختصاصی اون رو باز کن."
-    )
+    with db() as con:
+        track = con.execute(
+            "SELECT * FROM rb_tracks WHERE id=?",
+            (track_id,),
+        ).fetchone()
 
-    if is_admin(user.id):
-        text += (
-            "\n\n👑 شما ادمین ربات هستید.\n"
-            "برای دیدن دستورهای مدیریتی بزنید:\n"
-            "/admin"
+    if not track:
+        await message.reply_text("❌ این آهنگ پیدا نشد.")
+        return
+
+    missing = await check_membership(context, user.id)
+
+    if missing:
+        await message.reply_text(
+            get_setting("join_text"),
+            reply_markup=membership_keyboard(missing),
         )
+        return
 
-    await update.effective_message.reply_text(text)
+    try:
+        if track["file_type"] == "audio":
+            await message.reply_audio(
+                audio=track["file_id"],
+                caption="🎧 ریمیکس شما آماده است ❤️",
+            )
+        else:
+            await message.reply_document(
+                document=track["file_id"],
+                caption="🎧 فایل شما آماده است ❤️",
+            )
 
+    except TelegramError:
+        log.exception("Track sending failed")
+        await message.reply_text("❌ ارسال فایل ناموفق بود.")
 
-# ==========================================
-# دستور شروع
-# ==========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    save_user(user)
+    message = update.effective_message
 
-    if not context.args:
-        await send_welcome(update, context)
+    if context.args and context.args[0].isdigit():
+        await send_track(update, context, int(context.args[0]))
         return
 
-    payload = context.args[0]
+    text = (
+        "سلام ❤️ به ربات دانلود ریمیکس خوش اومدی!\n\n"
+        "برای دانلود، لینک اختصاصی آهنگ رو باز کن."
+    )
 
-    try:
-        track_id = int(payload)
-    except ValueError:
-        await send_welcome(update, context)
-        return
-
-    track = get_track(track_id)
-
-    if not track:
-        await update.effective_message.reply_text(
-            "❌ این آهنگ پیدا نشد یا لینک آن معتبر نیست."
+    if is_admin(user.id):
+        await message.reply_text(
+            text + "\n\nبرای پنل مدیریت /admin رو بفرست.",
+            reply_markup=home_menu(),
         )
-        return
-
-    if not await check_membership(
-        context.bot,
-        user.id,
-    ):
-        await update.effective_message.reply_text(
-            "🔒 برای دریافت آهنگ، ابتدا عضو کانال‌های زیر شو "
-            "و سپس روی بررسی عضویت بزن.",
-            reply_markup=membership_keyboard(track_id),
-        )
-        return
-
-    try:
-        await send_track(
-            update.effective_chat.id,
-            track,
-            context,
-        )
-    except Exception:
-        logger.exception("Could not send track")
-        await update.effective_message.reply_text(
-            "❌ ارسال آهنگ با خطا مواجه شد. لطفاً بعداً تلاش کن."
-        )
-
-
-# ==========================================
-# بررسی عضویت
-# ==========================================
-
-async def check_membership_callback(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    save_user(user)
-
-    try:
-        track_id = int(query.data.split(":", 1)[1])
-    except (ValueError, IndexError):
-        track_id = 0
-
-    if not await check_membership(context.bot, user.id):
-        await query.answer(
-            "هنوز عضویت شما در همهٔ کانال‌ها تأیید نشده است.",
-            show_alert=True,
-        )
-        return
-
-    if track_id:
-        track = get_track(track_id)
-
-        if not track:
-            await query.message.reply_text(
-                "❌ این آهنگ پیدا نشد."
-            )
-            return
-
-        try:
-            await send_track(
-                query.message.chat_id,
-                track,
-                context,
-            )
-        except Exception:
-            logger.exception("Could not send track after membership")
-            await query.message.reply_text(
-                "❌ ارسال آهنگ ناموفق بود."
-            )
     else:
-        await query.message.reply_text(
-            "✅ عضویت شما تأیید شد. حالا لینک آهنگ رو دوباره باز کن."
-        )
+        await message.reply_text(text, reply_markup=home_menu())
 
 
-# ==========================================
-# دریافت آهنگ توسط ادمین
-# ==========================================
+# =========================
+# ADMIN COMMANDS
+# =========================
 
-async def upload_track(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def admin_command(update, context):
+    user = update.effective_user
+
+    if not is_admin(user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    await update.effective_message.reply_text(
+        "👨‍💻 پنل مدیریت",
+        reply_markup=admin_menu(),
+    )
+
+
+async def addchannel_command(update, context):
     user = update.effective_user
     message = update.effective_message
 
-    save_user(user)
+    if not is_admin(user.id):
+        await message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    if not context.args:
+        await message.reply_text(
+            "فرمت:\n/addchannel @channelusername\n\n"
+            "ربات باید در کانال مدیر باشد."
+        )
+        return
+
+    try:
+        chat = await context.bot.get_chat(context.args[0])
+        bot_member = await context.bot.get_chat_member(
+            chat.id, context.bot.id
+        )
+
+        if bot_member.status not in ("administrator", "creator"):
+            await message.reply_text("❌ ربات باید مدیر کانال باشد.")
+            return
+
+        url = (
+            f"https://t.me/{chat.username}"
+            if chat.username else ""
+        )
+
+        with db() as con:
+            con.execute(
+                """INSERT OR IGNORE INTO rb_channels
+                   (chat_id, title, url) VALUES (?, ?, ?)""",
+                (str(chat.id), chat.title or "", url),
+            )
+
+        await message.reply_text("✅ کانال ثبت شد.")
+
+    except TelegramError:
+        await message.reply_text(
+            "❌ کانال پیدا نشد یا دسترسی کافی نیست."
+        )
+
+
+async def channels_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    with db() as con:
+        rows = con.execute(
+            "SELECT * FROM rb_channels ORDER BY id"
+        ).fetchall()
+
+    if not rows:
+        await update.effective_message.reply_text("کانالی ثبت نشده.")
+        return
+
+    text = "\n".join(
+        f"{r['id']}. {r['title']} — {r['chat_id']}"
+        for r in rows
+    )
+    await update.effective_message.reply_text(text)
+
+
+async def delchannel_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "فرمت:\n/delchannel شناسه"
+        )
+        return
+
+    with db() as con:
+        cur = con.execute(
+            "DELETE FROM rb_channels WHERE id=?",
+            (int(context.args[0]),),
+        )
+
+    await update.effective_message.reply_text(
+        "✅ حذف شد." if cur.rowcount else "❌ شناسه پیدا نشد."
+    )
+
+
+async def newcampaign_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
 
     if not is_admin(user.id):
+        await message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    if len(context.args) < 2:
+        await message.reply_text(
+            "فرمت:\n/newcampaign @channel هدف\n"
+            "مثال: /newcampaign @mychannel 500\n"
+            "هدف 0 یعنی نامحدود."
+        )
+        return
+
+    try:
+        target = int(context.args[1])
+        if target < 0:
+            raise ValueError
+
+        chat = await context.bot.get_chat(context.args[0])
+        bot_member = await context.bot.get_chat_member(
+            chat.id, context.bot.id
+        )
+
+        if bot_member.status not in ("administrator", "creator"):
+            await message.reply_text("❌ ربات باید مدیر کانال باشد.")
+            return
+
+        invite = await context.bot.create_chat_invite_link(
+            chat_id=chat.id,
+            name=f"campaign-{int(datetime.now().timestamp())}",
+        )
+
+        with db() as con:
+            cur = con.execute(
+                """INSERT INTO rb_campaigns
+                   (chat_id, title, invite_link, target, active, created_at)
+                   VALUES (?, ?, ?, ?, 1, ?)""",
+                (
+                    str(chat.id),
+                    chat.title or "",
+                    invite.invite_link,
+                    target,
+                    now(),
+                ),
+            )
+            campaign_id = cur.lastrowid
+
+        await message.reply_text(
+            f"✅ کمپین ساخته شد\n"
+            f"شناسه: {campaign_id}\n"
+            f"هدف: {target or 'نامحدود'}\n"
+            f"لینک دعوت:\n{invite.invite_link}"
+        )
+
+    except (TelegramError, ValueError):
+        await message.reply_text(
+            "❌ ساخت کمپین ناموفق بود. کانال، هدف و دسترسی ربات را بررسی کن."
+        )
+
+
+async def campaigns_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    with db() as con:
+        campaigns = con.execute(
+            "SELECT * FROM rb_campaigns ORDER BY id DESC"
+        ).fetchall()
+
+    if not campaigns:
+        await update.effective_message.reply_text("کمپینی ثبت نشده.")
+        return
+
+    for c in campaigns:
+        with db() as con:
+            count = con.execute(
+                """SELECT COUNT(*) AS n FROM rb_campaign_joins
+                   WHERE campaign_id=?""",
+                (c["id"],),
+            ).fetchone()["n"]
+
+        status = "فعال" if c["active"] else "متوقف"
+
+        await update.effective_message.reply_text(
+            f"🎯 کمپین {c['id']}\n"
+            f"کانال: {c['title']}\n"
+            f"اعضا: {count}\n"
+            f"هدف: {c['target'] or 'نامحدود'}\n"
+            f"وضعیت: {status}\n"
+            f"لینک: {c['invite_link']}\n\n"
+            f"توقف: /pausecampaign {c['id']}\n"
+            f"ادامه: /resumecampaign {c['id']}\n"
+            f"حذف: /delcampaign {c['id']}"
+        )
+
+
+async def campaign_action(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    command = update.effective_message.text.split()[0].split("@")[0]
+
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text(
+            "شناسهٔ کمپین را وارد کن."
+        )
+        return
+
+    campaign_id = int(context.args[0])
+
+    if command == "/pausecampaign":
+        sql = "UPDATE rb_campaigns SET active=0 WHERE id=?"
+    elif command == "/resumecampaign":
+        sql = "UPDATE rb_campaigns SET active=1 WHERE id=?"
+    else:
+        sql = "DELETE FROM rb_campaigns WHERE id=?"
+
+    with db() as con:
+        cur = con.execute(sql, (campaign_id,))
+
+    await update.effective_message.reply_text(
+        "✅ انجام شد." if cur.rowcount else "❌ کمپین پیدا نشد."
+    )
+
+
+async def admins_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+
+    if user.id != ADMIN_ID:
+        await message.reply_text(
+            "⛔️ فقط مدیر اصلی می‌تواند فهرست مدیران را مدیریت کند."
+        )
+        return
+
+    with db() as con:
+        rows = con.execute(
+            "SELECT user_id FROM rb_admins ORDER BY user_id"
+        ).fetchall()
+
+    text = f"مدیر اصلی: {ADMIN_ID}\n"
+    text += "\n".join(str(r["user_id"]) for r in rows)
+    text += (
+        "\n\nافزودن مدیر:\n/addadmin شناسه"
+        "\nحذف مدیر:\n/deladmin شناسه"
+    )
+
+    await message.reply_text(text)
+
+
+async def admin_manage_command(update, context):
+    user = update.effective_user
+    message = update.effective_message
+
+    if user.id != ADMIN_ID:
+        await message.reply_text("⛔️ فقط مدیر اصلی مجاز است.")
+        return
+
+    command = message.text.split()[0].split("@")[0]
+
+    if not context.args or not context.args[0].isdigit():
+        await message.reply_text("یک شناسهٔ عددی وارد کن.")
+        return
+
+    target = int(context.args[0])
+
+    if target == ADMIN_ID:
+        await message.reply_text("مدیر اصلی را نمی‌توان حذف یا اضافه کرد.")
+        return
+
+    with db() as con:
+        if command == "/addadmin":
+            con.execute(
+                "INSERT OR IGNORE INTO rb_admins(user_id) VALUES(?)",
+                (target,),
+            )
+            answer = "✅ مدیر اضافه شد."
+        else:
+            con.execute(
+                "DELETE FROM rb_admins WHERE user_id=?",
+                (target,),
+            )
+            answer = "✅ دستور حذف انجام شد."
+
+    await message.reply_text(answer)
+
+
+async def stats_command(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("⛔️ دسترسی نداری.")
+        return
+
+    with db() as con:
+        tracks = con.execute(
+            "SELECT COUNT(*) AS n FROM rb_tracks"
+        ).fetchone()["n"]
+        channels = con.execute(
+            "SELECT COUNT(*) AS n FROM rb_channels"
+        ).fetchone()["n"]
+        campaigns = con.execute(
+            "SELECT COUNT(*) AS n FROM rb_campaigns"
+        ).fetchone()["n"]
+
+    await update.effective_message.reply_text(
+        f"📊 آمار ربات\n\n"
+        f"🎵 آهنگ‌ها: {tracks}\n"
+        f"📢 کانال‌ها: {channels}\n"
+        f"🎯 کمپین‌ها: {campaigns}"
+    )
+
+
+# =========================
+# CALLBACKS
+# =========================
+
+async def admin_callbacks(update, context):
+    query = update.callback_query
+    user = update.effective_user
+    action = query.data or ""
+
+    await query.answer()
+
+    if action == "help":
+        await query.message.reply_text(
+            "برای دانلود، لینک اختصاصی آهنگ را باز کن."
+        )
+        return
+
+    if action == "checkjoin":
+        missing = await check_membership(context, user.id)
+
+        if missing:
+            await query.message.reply_text(
+                get_setting("join_text"),
+                reply_markup=membership_keyboard(missing),
+            )
+        else:
+            await query.message.reply_text(
+                "✅ عضویت تأیید شد. لینک آهنگ را دوباره باز کن."
+            )
+        return
+
+    if not is_admin(user.id):
+        await query.answer("⛔️ دسترسی نداری.", show_alert=True)
+        return
+
+    if action == "addtrack":
+        set_state(user.id, "waiting_track")
+        await query.message.reply_text(
+            "فایل آهنگ را به صورت Audio یا Document بفرست."
+        )
+
+    elif action == "deltrack":
+        with db() as con:
+            tracks = con.execute(
+                "SELECT id, title FROM rb_tracks ORDER BY id DESC LIMIT 50"
+            ).fetchall()
+
+        if not tracks:
+            await query.message.reply_text("آهنگی ثبت نشده.")
+            return
+
+        rows = [
+            [InlineKeyboardButton(
+                f"🗑 {r['id']} - {(r['title'] or 'بدون نام')[:25]}",
+                callback_data=f"deltrack:{r['id']}",
+            )]
+            for r in tracks
+        ]
+
+        await query.message.reply_text(
+            "آهنگ موردنظر را انتخاب کن:",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif action.startswith("deltrack:"):
+        track_id = action.split(":", 1)[1]
+
+        if track_id.isdigit():
+            with db() as con:
+                con.execute(
+                    "DELETE FROM rb_tracks WHERE id=?",
+                    (int(track_id),),
+                )
+            await query.message.reply_text("✅ آهنگ حذف شد.")
+
+    elif action == "channels":
+        await query.message.reply_text(
+            "دستورها:\n"
+            "/addchannel @channelusername\n"
+            "/channels\n"
+            "/delchannel شناسه"
+        )
+
+    elif action == "campaigns":
+        await campaigns_command(update, context)
+
+    elif action == "jointext":
+        set_state(user.id, "waiting_join_text")
+        await query.message.reply_text("متن جدید عضویت را بفرست.")
+
+    elif action == "stats":
+        await stats_command(update, context)
+
+    elif action == "admins":
+        await query.message.reply_text(
+            "مدیریت مدیران:\n"
+            "/admins\n/addadmin شناسه\n/deladmin شناسه"
+        )
+
+
+# =========================
+# MESSAGES
+# =========================
+
+async def handle_media(update, context):
+    user = update.effective_user
+    message = update.effective_message
+
+    if not is_admin(user.id):
+        return
+
+    if get_state(user.id) != "waiting_track":
         return
 
     if message.audio:
         file_id = message.audio.file_id
         file_type = "audio"
-        title = (
-            message.audio.title
-            or message.audio.file_name
-            or "آهنگ"
-        )
+        title = message.audio.title or message.audio.file_name or "Audio"
 
     elif message.document:
         file_id = message.document.file_id
         file_type = "document"
-        title = message.document.file_name or "فایل صوتی"
+        title = message.document.file_name or "File"
 
     else:
+        await message.reply_text("لطفاً فایل صوتی بفرست.")
         return
 
-    track_id = save_track(
-        file_id=file_id,
-        file_type=file_type,
-        title=title,
-        uploader_id=user.id,
-    )
+    track_id = save_track(file_id, file_type, title)
+    clear_state(user.id)
 
-    bot_info = await context.bot.get_me()
-    link = f"https://t.me/{bot_info.username}?start={track_id}"
+    me = await context.bot.get_me()
+    link = f"https://t.me/{me.username}?start={track_id}"
 
     await message.reply_text(
-        "✅ فایل با موفقیت ذخیره شد!\n\n"
-        f"🎵 نام: {title}\n"
-        f"🆔 شناسه: {track_id}\n\n"
-        "🔗 لینک اختصاصی آهنگ:\n"
-        f"{link}\n\n"
-        "این لینک رو می‌تونی برای دیگران بفرستی."
+        f"✅ آهنگ ذخیره شد!\n"
+        f"شناسه: {track_id}\n"
+        f"نام: {title}\n\n"
+        f"🔗 لینک دانلود:\n{link}"
     )
 
 
-# ==========================================
-# پنل مدیریت
-# ==========================================
+async def handle_text(update, context):
+    user = update.effective_user
+    message = update.effective_message
 
-async def admin_panel(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ شما اجازهٔ دسترسی ندارید."
+    if not user or not message or not is_admin(user.id):
+        return
+
+    state = get_state(user.id)
+
+    if state == "waiting_join_text":
+        set_setting("join_text", message.text or "")
+        clear_state(user.id)
+        await message.reply_text("✅ متن ذخیره شد.")
+        return
+
+    if state == "waiting_track":
+        await message.reply_text(
+            "لطفاً آهنگ را به صورت فایل Audio یا Document بفرست."
         )
         return
 
-    text = (
-        "👑 پنل مدیریت ربات\n\n"
-        "🎵 ارسال آهنگ یا فایل به ربات:\n"
-        "برای ذخیرهٔ آهنگ و ساخت لینک، فایل رو همین‌جا بفرست.\n\n"
-        "📊 /stats — آمار ربات\n"
-        "➕ /addchannel @channel [link] — افزودن کانال اجباری\n"
-        "📋 /channels — فهرست کانال‌ها\n"
-        "➖ /delchannel ID — حذف کانال\n"
-        "📢 /broadcast متن پیام — ارسال پیام همگانی\n\n"
-        "نکته: برای بررسی عضویت، ربات باید به کانال دسترسی داشته باشه."
+
+# =========================
+# CAMPAIGN JOIN TRACKING
+# =========================
+
+async def track_campaign_join(update, context):
+    change = update.chat_member
+
+    if not change:
+        return
+
+    old_status = change.old_chat_member.status
+    new_status = change.new_chat_member.status
+
+    joined = ("member", "administrator", "creator")
+
+    if old_status in joined or new_status not in joined:
+        return
+
+    user = change.new_chat_member.user
+
+    if user.is_bot:
+        return
+
+    invite_link = (
+        change.invite_link.invite_link
+        if change.invite_link else None
     )
 
-    await update.effective_message.reply_text(text)
-
-
-async def stats(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
+    if not invite_link:
         return
 
-    users, tracks, channels = get_stats()
+    with db() as con:
+        campaign = con.execute(
+            """SELECT * FROM rb_campaigns
+               WHERE invite_link=? AND active=1""",
+            (invite_link,),
+        ).fetchone()
 
-    await update.effective_message.reply_text(
-        "📊 آمار ربات\n\n"
-        f"👥 کاربران ثبت‌شده: {users}\n"
-        f"🎵 آهنگ‌ها: {tracks}\n"
-        f"📢 کانال‌های اجباری: {channels}"
-    )
+        if not campaign:
+            return
 
-
-# ==========================================
-# مدیریت کانال‌ها
-# ==========================================
-
-async def add_channel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "روش استفاده:\n"
-            "/addchannel @channel https://t.me/channel\n\n"
-            "اگر لینک عمومی کانال با نام کاربری یکی است، "
-            "می‌تونی فقط @channel رو بنویسی."
-        )
-        return
-
-    username = context.args[0].strip()
-
-    if not username.startswith("@"):
-        username = "@" + username
-
-    if len(context.args) >= 2:
-        url = context.args[1].strip()
-    else:
-        url = "https://t.me/" + username.lstrip("@")
-
-    if not url.startswith(("https://t.me/", "http://t.me/")):
-        await update.effective_message.reply_text(
-            "❌ لینک باید یک لینک معتبر تلگرام باشد."
-        )
-        return
-
-    try:
-        chat = await context.bot.get_chat(username)
-
-        add_channel(
-            username=username,
-            url=url,
-            title=chat.title or username,
+        con.execute(
+            """INSERT OR IGNORE INTO rb_campaign_joins
+               (campaign_id, user_id, joined_at)
+               VALUES (?, ?, ?)""",
+            (campaign["id"], user.id, now()),
         )
 
-        await update.effective_message.reply_text(
-            "✅ کانال ثبت شد.\n\n"
-            f"📢 نام: {chat.title or username}\n"
-            f"🔗 لینک: {url}\n\n"
-            "برای بررسی عضویت کاربران، مطمئن شو ربات "
-            "به کانال دسترسی لازم را دارد."
-        )
+        count = con.execute(
+            """SELECT COUNT(*) AS n FROM rb_campaign_joins
+               WHERE campaign_id=?""",
+            (campaign["id"],),
+        ).fetchone()["n"]
 
-    except Exception:
-        logger.exception("Could not add channel")
-        await update.effective_message.reply_text(
-            "❌ ثبت کانال ناموفق بود.\n"
-            "نام کاربری کانال و دسترسی ربات رو بررسی کن."
-        )
-
-
-async def list_channels(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
-        return
-
-    channels = get_channels()
-
-    if not channels:
-        await update.effective_message.reply_text(
-            "هنوز کانال اجباری ثبت نشده."
-        )
-        return
-
-    lines = ["📋 فهرست کانال‌های اجباری:\n"]
-
-    for channel in channels:
-        lines.append(
-            f"شناسه: {channel['id']}\n"
-            f"نام: {channel['title'] or channel['username']}\n"
-            f"آدرس: {channel['url']}\n"
-        )
-
-    lines.append("برای حذف کانال:\n/delchannel ID")
-
-    await update.effective_message.reply_text(
-        "\n".join(lines)
-    )
-
-
-async def del_channel_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
-        return
-
-    if not context.args:
-        await update.effective_message.reply_text(
-            "روش استفاده:\n/delchannel ID"
-        )
-        return
-
-    try:
-        channel_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text(
-            "❌ شناسه باید عدد باشد."
-        )
-        return
-
-    if delete_channel(channel_id):
-        await update.effective_message.reply_text(
-            "✅ کانال حذف شد."
-        )
-    else:
-        await update.effective_message.reply_text(
-            "❌ چنین شناسه‌ای پیدا نشد."
-        )
-
-
-# ==========================================
-# پیام همگانی
-# ==========================================
-
-async def broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    if not is_admin(update.effective_user.id):
-        await update.effective_message.reply_text(
-            "⛔ دسترسی غیرمجاز."
-        )
-        return
-
-    text = " ".join(context.args).strip()
-
-    if not text:
-        await update.effective_message.reply_text(
-            "روش استفاده:\n/broadcast متن پیام"
-        )
-        return
-
-    user_ids = get_all_user_ids()
-
-    sent = 0
-    failed = 0
-
-    status = await update.effective_message.reply_text(
-        "⏳ ارسال پیام همگانی شروع شد..."
-    )
-
-    for user_id in user_ids:
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=text,
-            )
-            sent += 1
-
-        except Exception:
-            failed += 1
-            logger.warning(
-                "Broadcast failed for user %s",
-                user_id,
+        if campaign["target"] > 0 and count >= campaign["target"]:
+            con.execute(
+                "UPDATE rb_campaigns SET active=0 WHERE id=?",
+                (campaign["id"],),
             )
 
-    await status.edit_text(
-        "✅ ارسال همگانی تمام شد.\n\n"
-        f"📨 ارسال موفق: {sent}\n"
-        f"❌ ناموفق: {failed}"
-    )
 
+# =========================
+# ERROR HANDLER
+# =========================
 
-# ==========================================
-# خطاها
-# ==========================================
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logger.error(
-        "Unhandled exception",
+async def error_handler(update, context):
+    log.error(
+        "Update processing failed",
         exc_info=context.error,
     )
 
 
-# ==========================================
-# اجرای ربات
-# ==========================================
+# =========================
+# MAIN
+# =========================
 
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "متغیر محیطی BOT_TOKEN در Runflare تنظیم نشده است."
+            "BOT_TOKEN در تنظیمات Runflare تعریف نشده است."
         )
 
     init_db()
 
-    application = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("admin", admin_panel))
-    application.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin_command))
 
-    application.add_handler(
-        CommandHandler("addchannel", add_channel_command)
-    )
-    application.add_handler(
-        CommandHandler("channels", list_channels)
-    )
-    application.add_handler(
-        CommandHandler("delchannel", del_channel_command)
-    )
+    app.add_handler(CommandHandler("addchannel", addchannel_command))
+    app.add_handler(CommandHandler("channels", channels_command))
+    app.add_handler(CommandHandler("delchannel", delchannel_command))
 
-    application.add_handler(
-        CommandHandler("broadcast", broadcast)
-    )
+    app.add_handler(CommandHandler("newcampaign", newcampaign_command))
+    app.add_handler(CommandHandler("campaigns", campaigns_command))
+    app.add_handler(CommandHandler(
+        ["pausecampaign", "resumecampaign", "delcampaign"],
+        campaign_action,
+    ))
 
-    application.add_handler(
-        CallbackQueryHandler(
-            check_membership_callback,
-            pattern=r"^check:",
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("admins", admins_command))
+    app.add_handler(CommandHandler(
+        ["addadmin", "deladmin"],
+        admin_manage_command,
+    ))
+
+    app.add_handler(CallbackQueryHandler(admin_callbacks))
+
+    app.add_handler(
+        ChatMemberHandler(
+            track_campaign_join,
+            ChatMemberHandler.CHAT_MEMBER,
         )
     )
 
-    application.add_handler(
+    app.add_handler(
         MessageHandler(
             filters.AUDIO | filters.Document.ALL,
-            upload_track,
+            handle_media,
         )
     )
 
-    application.add_error_handler(error_handler)
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_text,
+        )
+    )
 
-    logger.info("Bot is starting...")
+    app.add_error_handler(error_handler)
 
-    application.run_polling(
-        drop_pending_updates=False,
+    log.info("Bot is starting")
+    app.run_polling(
+        allowed_updates=[
+            "message",
+            "callback_query",
+            "chat_member",
+        ]
     )
 
 
