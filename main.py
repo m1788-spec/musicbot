@@ -25,8 +25,7 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8982085745"))
-DB_PATH = os.getenv("DB_PATH", "/app/bot.db")
-
+DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
